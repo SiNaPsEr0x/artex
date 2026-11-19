@@ -1,0 +1,58 @@
+name: sync-upstream
+
+# Aggiorna ogni giorno il branch main del fork con BaaRai/ARTEX (repo principale).
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # ogni giorno alle 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: BaaRai/ARTEX
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+
+jobs:
+  sync:
+    # non girare nel repo principale, solo nel fork
+    if: github.repository != 'BaaRai/ARTEX'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          # Se upstream modifica .github/workflows/*, GITHUB_TOKEN non può
+          # pushare: imposta il secret SYNC_TOKEN (PAT con scope repo + workflow).
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "Già aggiornato."
+            exit 0
+          fi
+
+          # fast-forward se possibile, altrimenti merge commit
+          if ! git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            git merge --abort || true
+            echo "::error::Conflitto di merge con ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}: risolvere a mano."
+            exit 1
+          fi
+
+          git push origin "HEAD:${TARGET_BRANCH}"
