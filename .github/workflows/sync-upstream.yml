@@ -30,9 +30,6 @@ jobs:
         with:
           ref: ${{ env.TARGET_BRANCH }}
           fetch-depth: 0
-          # Se upstream modifica .github/workflows/*, GITHUB_TOKEN non può
-          # pushare: imposta il secret SYNC_TOKEN (PAT con scope repo + workflow).
-          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Merge upstream
         run: |
@@ -48,11 +45,19 @@ jobs:
             exit 0
           fi
 
-          # fast-forward se possibile, altrimenti merge commit
-          if ! git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+          # Merge senza commit: .github/workflows/* resta quello del fork
+          # (GITHUB_TOKEN non può pushare modifiche ai workflow, e i workflow
+          # di upstream non servono qui).
+          git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}" || true
+          git rm -rfq --cached .github/workflows 2>/dev/null || true
+          git clean -fdxq .github/workflows
+          git checkout HEAD -- .github/workflows
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
             git merge --abort || true
             echo "::error::Conflitto di merge con ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}: risolvere a mano."
             exit 1
           fi
 
+          git commit --no-edit -m "Merge ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (sync automatico)"
           git push origin "HEAD:${TARGET_BRANCH}"
