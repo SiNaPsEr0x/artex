@@ -840,6 +840,7 @@ export const api = {
       body?: string;
       path?: string;
       status?: string;
+      rewritten?: string;
       respMin?: string;
       respMax?: string;
       sort?: string;
@@ -854,6 +855,7 @@ export const api = {
         (opts.body ? `&body=${encodeURIComponent(opts.body)}` : "") +
         (opts.path ? `&path=${encodeURIComponent(opts.path)}` : "") +
         (opts.status && opts.status !== "all" ? `&status=${encodeURIComponent(opts.status)}` : "") +
+        (opts.rewritten && opts.rewritten !== "all" ? `&rewritten=${encodeURIComponent(opts.rewritten)}` : "") +
         (opts.respMin ? `&resp_min=${encodeURIComponent(opts.respMin)}` : "") +
         (opts.respMax ? `&resp_max=${encodeURIComponent(opts.respMax)}` : "") +
         (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
@@ -874,11 +876,15 @@ export const api = {
     if (!r.ok) throw new Error(t("Blob download failed: {error}", { error: r.status }));
     return new Uint8Array(await r.arrayBuffer());
   },
-  // Re-sends an edited request through the proxy. Errors carry the HTTP status
-  // (ApiError): 413 body too large, 502 proxy/upstream, 503 capture off, 504 timeout.
+  // Re-sends an edited request through the proxy (bypasses capture rewrite rules
+  // unless req.apply_rules is true). Errors carry the HTTP status (ApiError):
+  // 413 body too large, 502 proxy/upstream, 503 capture off, 504 timeout.
   trafficReplay: async (req: TrafficReplayRequest) => {
     if (MOCK) throw new Error(t("Replay is not available in mock mode"));
-    return post<TrafficReplayResult>(`/traffic/replay`, req);
+    return post<TrafficReplayResult>(`/traffic/replay`, {
+      ...req,
+      apply_rules: Boolean(req.apply_rules),
+    });
   },
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
