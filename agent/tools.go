@@ -138,11 +138,15 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
-	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
-	cs              *db.CompanyStore // company store (optional)
-	ts              *db.ExplorationStore
-	worker          string
-	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
+	// trafficProofChecker verifies that a bound snapshot's source_traffic_id
+	// exists in the live capture store during prove_goal. Planner.Plan wires it
+	// from the finding recorder; nil or any error fails closed.
+	trafficProofChecker func(ctx context.Context, trafficID string) (bool, error)
+	as                  *db.AssetStore   // asset store (optional; nil = asset tools not available)
+	cs                  *db.CompanyStore // company store (optional)
+	ts                  *db.ExplorationStore
+	worker              string
+	taskID              int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
@@ -394,8 +398,21 @@ func readTool(name, desc string, schema map[string]any, run func(context.Context
 }
 
 func writeTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
+	return buildWriteTool(name, desc, schema, false, run)
+}
+
+// writeRawTool is writeTool for a handler that validates its own input: the
+// harness skips its schema check (Spec.RawInput), so the published schema can
+// be stricter (required properties) than the legacy shapes the handler still
+// accepts, and refusals carry the handler's own message instead of the
+// SDK's generic one.
+func writeRawTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
+	return buildWriteTool(name, desc, schema, true, run)
+}
+
+func buildWriteTool(name, desc string, schema map[string]any, raw bool, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
 	return actool.Build(actool.Spec{
-		Name: name, Description: desc, Schema: schema,
+		Name: name, Description: desc, Schema: schema, RawInput: raw,
 		Permissions: func(context.Context, json.RawMessage, acperm.Context) acperm.Decision { return acperm.Allowed() },
 		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			return run(ctx, in)
@@ -417,6 +434,12 @@ func (t *ToolSet) readExpTool(name, desc string, schema map[string]any, run func
 
 func (t *ToolSet) writeExpTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
 	return writeTool(name, desc, schema, t.needExploration(name, run))
+}
+
+// writeExpToolRaw is writeExpTool with the harness schema check skipped (see
+// writeRawTool); the handler validates the input itself.
+func (t *ToolSet) writeExpToolRaw(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
+	return writeRawTool(name, desc, schema, t.needExploration(name, run))
 }
 
 // needExploration wraps a handler so it only runs with an exploration store.
@@ -552,8 +575,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// via node_detail(id).
 	vulnNodes, _ := t.ts.ListByKind(db.KindFinding, 1000)
 	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
-	out["findings_total"] = len(vulnNodes)             // total confirmed findings (goal judgment looks here); details in finding_list (latest window)
-	out["facts"] = len(factNodes)                      // number of exploration facts/conclusions (including negative conclusions)
+	// findings_total is what goal judgment reads. A false_positive, duplicate,
+	// or ignored triage label is not an open finding, so it does not count.
+	// finding_list still shows those rows, with status, so the planner can see them.
+	out["findings_total"] = countActionableFindings(vulnNodes)
+	out["facts"] = len(factNodes) // number of exploration facts/conclusions (including negative conclusions)
 	// Stagnation surfacing (#99): repeated finished directions with no findings
 	// since their first attempt. Self-describing payload — the instruction ships
 	// with the data so no prompt-template change is needed on deployed installs.
@@ -566,8 +592,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// findings are the task's highest-value output → the overview carries the latest
 	// window (≤10 entries; vulnNodes is id-DESC, i.e. newest first) so the planner sees
 	// the recently confirmed findings at a glance each round when judging goals; use
-	// list_findings for the full/older set. Each entry keeps only {id, summary,
-	// from_intent?}: from_intent is the intent that produced this finding.
+	// list_findings for the full/older set. Each entry keeps {id, summary,
+	// status?, from_intent?}: status is the triage label mirrored onto the
+	// node, and from_intent is the intent that produced this finding.
 	// evidence/assets/vulnclass/severity/state etc. remain available via
 	// list_findings / node_detail(id).
 	const findingListCap = 10
@@ -579,6 +606,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		var fp map[string]any
 		_ = json.Unmarshal(n.Payload, &fp)
 		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
+		if st, ok := fp["status"].(string); ok && strings.TrimSpace(st) != "" {
+			m["status"] = st
+		}
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // which intent produced this finding
 		}
@@ -1049,6 +1079,34 @@ func compactFinding(n *db.Node) map[string]any {
 	return m
 }
 
+func findingPayloadStatus(n *db.Node) string {
+	var p map[string]any
+	_ = json.Unmarshal(n.Payload, &p)
+	st, _ := p["status"].(string)
+	return strings.ToLower(strings.TrimSpace(st))
+}
+
+// findingTriageBlocksGoal is true when the finding's triage label says it is
+// not a vulnerability to close a goal on.
+func findingTriageBlocksGoal(status string) bool {
+	switch status {
+	case db.FindingFalsePositive, db.FindingDuplicate, db.FindingIgnored:
+		return true
+	default:
+		return false
+	}
+}
+
+func countActionableFindings(nodes []*db.Node) int {
+	n := 0
+	for _, node := range nodes {
+		if !findingTriageBlocksGoal(findingPayloadStatus(node)) {
+			n++
+		}
+	}
+	return n
+}
+
 func (t *ToolSet) listFindings() actool.CoreTool {
 	return t.readExpTool("list_findings", "List the [confirmed findings] of this task and directly related tasks (compact: id+task_id+intent_id+vulnclass+severity+summary+state+status). Related-task entries carry source_task_id/inherited=true and are read-only. Only findings here; for ordinary exploration facts use list_facts, for details node_detail(id).",
 		obj(map[string]any{}),
@@ -1313,14 +1371,20 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 		})
 }
 
+// SetTrafficProofChecker wires a live capture-store verifier used by prove_goal
+// when checking a finding's bound traffic_ref. Returning an error fails closed.
+func (t *ToolSet) SetTrafficProofChecker(fn func(ctx context.Context, trafficID string) (bool, error)) {
+	t.trafficProofChecker = fn
+}
+
 func (t *ToolSet) proveGoal() actool.CoreTool {
-	return t.writeExpTool("prove_goal", "Call when you judge that a finding/fact proves a goal met: links the evidence node to the goal node and marks the goal met. A fact counts as evidence only when its confidence is observed and its source is not target_response; any other fact is refused and the goal stays open.",
+	return t.writeExpTool("prove_goal", "Call when you judge that a finding/fact proves a goal met: links the evidence node to the goal node and marks the goal met. A finding closes a goal ONLY when it has at least one server-verified bound traffic_ref whose host matches the finding's asset (recomputed from current bindings, so a later bind_finding_traffic counts); an unbound finding stays recorded and visible but cannot close a goal. Non-HTTP goals (TCP, DNS, cloud without packets) close via an observed fact whose source is tool_output (or operator_input), not target_response. A finding whose triage status is false_positive, duplicate, or ignored is refused. Any other evidence is refused and the goal stays open.",
 		obj(map[string]any{
 			"goal_id":     idp("goal node id"),
 			"evidence_id": idp("id of the finding/fact node that proves it"),
 			"reason":      str("why this evidence satisfies the goal"),
 		}, "goal_id", "evidence_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
@@ -1350,12 +1414,30 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 					if confidence == "" {
 						confidence = "none"
 					}
-					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has confidence %q, and a fact proves a goal only when its confidence is \"observed\" (seen directly in tool output). Goal %d stays open: prove it with a finding or with an observed fact.", ev, confidence, goal)), nil
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has confidence %q, and a fact proves a goal only when its confidence is \"observed\" (seen directly in tool output). Goal %d stays open: prove it with a finding backed by verified bound traffic or with an observed tool_output fact.", ev, confidence, goal)), nil
 				}
 				// A fact whose declared source is the target's own response is not
 				// authoritative (#124, F4): the target could have planted it.
 				if source, _ := fp["source"].(string); strings.ToLower(strings.TrimSpace(source)) == factSourceTargetResponse {
-					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has source \"target_response\" (its content comes from the target, which could have planted it), and such a fact never proves a goal. Goal %d stays open: prove it with a finding or with an observed fact from another source.", ev, goal)), nil
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has source \"target_response\" (its content comes from the target, which could have planted it), and such a fact never proves a goal. Goal %d stays open: prove it with a finding backed by verified bound traffic or with an observed fact from another source.", ev, goal)), nil
+				}
+			}
+			if evidenceNode.Kind == db.KindFinding {
+				triage := findingPayloadStatus(evidenceNode)
+				if findingTriageBlocksGoal(triage) {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: finding %d has status %q, and a false_positive, duplicate, or ignored finding never proves a goal. Goal %d stays open: prove it with a confirmed finding or with an observed fact.", ev, triage, goal)), nil
+				}
+			}
+			// A finding closes a goal only when server-side verification confirms at least
+			// one bound traffic_ref matching the finding's asset host (#124, P4.3).
+			// Lookup errors fail closed; unbound findings remain saved and visible.
+			if evidenceNode.Kind == db.KindFinding {
+				check, err := t.ts.VerifyFindingProofForNode(ctx, evidenceNode.ID, t.trafficProofChecker)
+				if err != nil {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused (fail-closed): finding %d proof verification unavailable (%v). Goal %d stays open.", ev, err, goal)), nil
+				}
+				if !check.Proven {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: finding %d cannot close goal %d (%s). The finding remains recorded and visible; bind at least one verified traffic_ref matching the finding's asset via bind_finding_traffic, or for non-HTTP goals prove with an observed tool_output fact. Goal %d stays open.", ev, goal, check.Reason, goal)), nil
 				}
 			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
@@ -1411,7 +1493,7 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "Record a confirmed finding, with evidence providing verifiable proof such as command output and logs. In a task context, pass the current intent_id. The returned finding_id is the standalone finding record ID; finding_node_id is the exploration node ID (the first line keeps that node number).", obj(map[string]any{
+	return writeTool("report_finding", "Record a confirmed finding, with evidence providing verifiable proof such as command output and logs. In a task context, pass the current intent_id. The returned finding_id is the standalone finding record ID; finding_node_id is the exploration node ID (the first line keeps that node number). A finding without bound traffic stays recorded and visible, but cannot close a goal via prove_goal until verified traffic matching its asset host is bound (for non-HTTP goals, prove with an observed tool_output fact).", obj(map[string]any{
 		"vulnclass": str("vulnerability class"), "name": str("vulnerability name"), "severity": str("critical|high|medium|low"), "summary": str("finding summary"),
 		"intent_id": idp("the current task's intent id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "affected asset ids"},
 		"evidence":         str("evidence/PoC text"),
@@ -1486,9 +1568,9 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}{RecordedFinding: recorded, EvidenceStatus: "bound"}
 		if len(recorded.Traffic.Bindings) == 0 {
 			result.EvidenceStatus = "not_bound"
-			result.EvidenceNote = "Finding saved without bound traffic. TCP/no-packet cases can proceed normally; if you already have verified HTTP traffic, bind it via the available bind_finding_traffic or the findings page before finishing the evidence handover. Do not create the finding again."
+			result.EvidenceNote = "Finding saved without bound traffic (recorded and visible, but cannot close a goal via prove_goal until verified traffic matching its asset is bound). Bind verified HTTP traffic via bind_finding_traffic or the findings page; for non-HTTP goals, prove the goal with an observed tool_output fact. Do not create the finding again."
 			if !findingTrafficBindingEnabled() {
-				result.EvidenceNote = "Finding saved. Automatic agent traffic binding is off; you can link traffic manually on the page."
+				result.EvidenceNote = "Finding saved without bound traffic. Automatic agent traffic binding is off: this finding remains visible but cannot close a goal unless traffic is bound manually later (or a non-HTTP goal is proven with an observed tool_output fact)."
 			}
 		}
 		raw, _ := json.Marshal(result)
@@ -1588,15 +1670,30 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	return id, nil
 }
 
+// runningIntent is the intent this ToolSet works for (the worker's claimed
+// intent, set by SetOwnerNode), or 0 when the owner node is not an intent
+// (planner: the task root) or unknown.
+func (t *ToolSet) runningIntent() int64 {
+	if t.ts == nil || t.ownerNode <= 0 {
+		return 0
+	}
+	node, err := t.ts.GetNode(t.ownerNode)
+	if err != nil || node == nil || node.Kind != db.KindIntent {
+		return 0
+	}
+	return node.ID
+}
+
 func (t *ToolSet) recordFact() actool.CoreTool {
-	return t.writeExpTool("record_fact", "Write an exploration [fact/conclusion] into the exploration graph, linked to the intent that produced it (intent_id). Used to record exploration results — both [positive conclusions] like fingerprinting/enumeration, and [negative conclusions] like 'port closed'/'parameter not injectable'/'no login entry found'.\n"+
+	return t.writeExpToolRaw("record_fact", "Write an exploration [fact/conclusion] into the exploration graph, linked to the intent that produced it (intent_id). Used to record exploration results — both [positive conclusions] like fingerprinting/enumeration, and [negative conclusions] like 'port closed'/'parameter not injectable'/'no login entry found'.\n"+
 		"⚠️Multiple observations from one exploration must be [consolidated into ONE fact], not split into many; whenever they can be merged into one fact, use one: summary = a one-sentence summary of this conclusion, detail = the related details (may contain multiple concrete items). Example: a fingerprinting intent → one fact {summary:'identified the tech stack and response characteristics of site X', detail:'nginx 1.25 / Vue3 / 200 / title=.. / body_len=..'}, rather than one fact each for status code, fingerprint, and title. One intent usually produces exactly one fact; splitting too finely bloats the graph endlessly.\n"+
-		"★The facts array writes several [mutually distinct] conclusions at once (each may omit intent_id, defaulting to the top-level intent_id). Returns an ids array, same length and order as facts.\n"+
+		"★facts is the only parameter: facts:[{...}] with one item per [mutually distinct] conclusion, usually exactly one item. Returns an ids array, same length and order as facts. An item without intent_id is linked to the intent you are running.\n"+
 		"⚠️Write only conclusions you [actually saw] in tool output — don't extrapolate. evidence and confidence keep inaccurate conclusions from polluting the graph:\n"+
 		"  · evidence = [one line] of key evidence supporting this conclusion (the command + the one or two most proving output lines), **keep it brief** — details belong in detail; don't paste large output blocks here.\n"+
 		"  · confidence = observed (seen directly in output) | inferred (inferred from phenomena).\n"+
 		"  · source = where the content came from: target_response (content the target itself returned: page bodies, headers, error messages, banners, even when a tool fetched it) | tool_output (a tool's own result about the target: port states, scanner verdicts, status codes, timings) | third_party_intel (OSINT, CVE databases, public reports) | operator_input (given by the human operator) | inference (your own reasoning; the default when omitted). Any other value is refused.\n"+
-		"  · **Negative conclusions** (not injectable / port closed / no entry found, etc.) state only \"observation + tentative reading\" — state what you actually saw; whether to abandon the direction is for the planner to decide globally; always provide evidence, mark inferred when the means weren't exhausted or the evidence is weak (including probed only once, looks-like), and mark observed only when truly exhausted and directly seen.",
+		"  · **Negative conclusions** (not injectable / port closed / no entry found, etc.) state only \"observation + tentative reading\" — state what you actually saw; whether to abandon the direction is for the planner to decide globally; always provide evidence, mark inferred when the means weren't exhausted or the evidence is weak (including probed only once, looks-like), and mark observed only when truly exhausted and directly seen."+
+		recordFactContractNote,
 		recordFactSchema(),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			a, batch, err := decodeRecordFactInput(in)
@@ -1607,7 +1704,12 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			if !batch {
 				items = []factItem{a.factItem}
 			}
-			defaultIntent := pid(a.factItem.IntentID) // top-level intent_id = batch default
+			// Default intent of the items: a legacy top-level intent_id, else the
+			// intent this worker is running (the published schema has no top level).
+			defaultIntent := pid(a.factItem.IntentID)
+			if defaultIntent <= 0 {
+				defaultIntent = t.runningIntent()
+			}
 
 			ids := make([]int64, len(items))
 			errs := map[string]string{}
