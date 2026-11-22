@@ -295,11 +295,16 @@ type Traffic struct {
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
 func Open(dir, addr string) (*Traffic, error) {
-	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_blobs"), filepath.Join(dir, "_ca")} {
+	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_ca")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, err
 		}
 	}
+	blobsRoot := filepath.Join(dir, "_blobs")
+	if err := os.MkdirAll(blobsRoot, 0o700); err != nil {
+		return nil, err
+	}
+	tightenBlobPerms(blobsRoot)
 	// busy_timeout is a per-connection setting, so it belongs in the DSN rather
 	// than in a one-off Exec: the pool opens connections on demand, and an Exec
 	// only configures whichever one happened to serve it — leaving every other
@@ -847,6 +852,38 @@ type storedBody struct {
 // reader can identify them without fetching the blob. Either way, text bodies
 // are handed to the full-text index in full (up to maxIndexBody) — indexing is
 // independent of where the bytes end up.
+// tightenBlobPerms restricts existing spilled blob directories to 0700 and
+// regular blob files to 0600 on startup so pre-existing 0755/0644 artifacts
+// from earlier versions do not stay world-readable.
+func tightenBlobPerms(root string) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if info.Mode().Perm() != 0o700 {
+				if err := os.Chmod(path, 0o700); err != nil {
+					log.Printf("[traffic] failed to restrict blob directory %s: %v", path, err)
+				}
+			}
+			return nil
+		}
+		if info.Mode().IsRegular() && info.Mode().Perm() != 0o600 {
+			if err := os.Chmod(path, 0o600); err != nil {
+				log.Printf("[traffic] failed to restrict blob %s: %v", path, err)
+			}
+		}
+		return nil
+	})
+}
+
 func (t *Traffic) spill(body []byte, contentType string) storedBody {
 	return t.spillAt(body, contentType, maxInlineBody)
 }
@@ -873,16 +910,21 @@ func (t *Traffic) spillAt(body []byte, contentType string, maxInline int) stored
 	// One bucket level (256 buckets) is enough to keep any single directory small;
 	// the store only ever holds bodies above maxInlineBody, deduplicated by hash.
 	blobDir := filepath.Join(t.dir, "_blobs", "sha256", h[:2])
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+	if err := os.MkdirAll(blobDir, 0o700); err != nil {
 		log.Printf("[traffic] failed to create blob directory: %v", err)
 		return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 	}
+	if err := os.Chmod(blobDir, 0o700); err != nil {
+		log.Printf("[traffic] failed to restrict blob directory: %v", err)
+	}
 	blobPath := filepath.Join(blobDir, h+".bin")
 	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-		if err := os.WriteFile(blobPath, body, 0o644); err != nil {
+		if err := os.WriteFile(blobPath, body, 0o600); err != nil {
 			log.Printf("[traffic] failed to write blob %s: %v", h, err)
 			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 		}
+	} else if err := os.Chmod(blobPath, 0o600); err != nil {
+		log.Printf("[traffic] failed to restrict blob %s: %v", h, err)
 	}
 	sb := storedBody{hash: h, index: indexText()}
 	if text {
@@ -1154,6 +1196,51 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// ResponseContaining reports the newest capture recorded in [fromTS,toTS]
+// (unix seconds) whose response side contains one of lines. Request-side matches
+// are ignored after the index lookup: what classifies a fact is what came back
+// from the target. ok is false when no capture matches, when this build has no
+// full-text index, or when the store is unavailable; callers keep the
+// activity-only classification in that case.
+func (t *Traffic) ResponseContaining(lines []string, fromTS, toTS int64) (id string, ok bool, err error) {
+	if t == nil || len(lines) == 0 {
+		return "", false, nil
+	}
+	for _, line := range lines {
+		cond, arg, hasFTS := t.ftsFilter(line)
+		if !hasFTS {
+			return "", false, nil
+		}
+		rows, qerr := t.db.Query(`SELECT id FROM exchanges
+WHERE ts>=? AND ts<=? AND `+cond+`
+ORDER BY ts DESC LIMIT 8`, fromTS, toTS, arg)
+		if qerr != nil {
+			return "", false, qerr
+		}
+		ids := make([]string, 0, 8)
+		for rows.Next() {
+			var cand string
+			if serr := rows.Scan(&cand); serr != nil {
+				rows.Close()
+				return "", false, serr
+			}
+			ids = append(ids, cand)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return "", false, err
+		}
+		for _, cand := range ids {
+			_, resp, gerr := t.Get(cand)
+			if gerr != nil || !strings.Contains(resp, line) {
+				continue
+			}
+			return cand, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // ftsFilter builds the SQL condition restricting rows to those whose indexed
